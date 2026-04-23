@@ -1,33 +1,11 @@
 """
-Milestone 1 — Online Games Popularity Prediction
-Predicting RecommendationCount using regression models.
+Milestone 1 - Predicting RecommendationCount for Online Games
 
-Models used:
-    1. Ridge Regression   (regularized linear — baseline)
-    2. Random Forest      (parallel ensemble, handles non-linearity)
-    3. LightGBM           (sequential leaf-wise boosting, best on tabular data)
-    4. Stacked Ensemble   (blends RF + LightGBM predictions with Ridge meta-learner)
-
-Key changes from v2 (which got LightGBM=83.1%, Stack=83.22%):
-    - Added percentile rank features for SteamSpy columns.
-      SteamSpy reports ownership in discrete brackets (0-20k, 20k-50k, etc.),
-      so the raw value is a bracket midpoint with noise. Converting to rank
-      (0.0-1.0) removes discretization noise and captures relative popularity.
-      players_rank alone has 0.786 correlation with log target — higher than
-      any single raw feature we had before.
-    - Added ownership bracket bounds: lower = Owners - Variance,
-      upper = Owners + Variance. Gives the model explicit access to the
-      SteamSpy bracket edges, not just the midpoint.
-    - Added PackageCount, DeveloperCount, PublisherCount to content features
-      (corr 0.27, 0.15, 0.16 respectively — were missing from v2)
-    - Added action×multiplayer interaction term (popular competitive games
-      like CS, TF2 sit in this bucket)
-    - Extended Ridge SelectKBest search to k=80 since k=60 was still the
-      best at the boundary of v2's search
-    - Removed target encoding (QueryName/ResponseName): almost all game names
-      appear only once in the dataset (11301 unique / 11357 rows), so OOF
-      target encoding collapsed to the global mean for ~99% of rows and
-      provided no useful signal beyond noise. Removed for cleanliness.
+We tried 4 models:
+    1. Ridge Regression - basic linear model with regularization (our baseline)
+    2. Random Forest - ensemble of trees, handles non-linear stuff well
+    3. LightGBM - gradient boosting, usually best on tabular data
+    4. Stacked Ensemble - combines RF + LightGBM predictions using Ridge on top
 """
 
 import json
@@ -63,20 +41,16 @@ sns.set_theme(style="whitegrid")
 
 
 # =============================================================================
-# PREPROCESSING & FEATURE ENGINEERING
+# FEATURE ENGINEERING
 # =============================================================================
 
 def make_date_features(df):
-    """
-    Parse ReleaseDate into calendar components.
-    release_age_days: older games have had more time to accumulate
-    recommendations — meaningful signal for popularity (corr=0.36).
-
-    Note: QueryID correlates at -0.47 with log target and is 0.91
-    correlated with release_age_days — they both proxy for game age.
-    We keep both since QueryID has no missing values and the models
-    can choose whichever split is cleaner.
-    """
+    # parse release date and get calendar features
+    # release_age_days is useful because older games have had more time to
+    # accumulate recommendations (corr=0.36 with log target)
+    # note: QueryID correlates at -0.47 with log target and is 0.91 correlated
+    # with release_age_days - both basically measure game age. we keep both
+    # since QueryID has no missing values.
     release  = pd.to_datetime(df["ReleaseDate"], errors="coerce")
     ref_date = release.dropna().max()
 
@@ -89,13 +63,10 @@ def make_date_features(df):
 
 
 def make_price_features(df):
-    """
-    Price-derived signals. Log-compress both price columns since raw
-    price is heavy-tailed. is_free and price_discount_ratio capture
-    pricing strategy.
-    Note: 1392 games have PriceFinal=0 but IsFree=False — a data
-    inconsistency we flag as price_free_mismatch.
-    """
+    # log compress both price columns (heavy tailed)
+    # is_free and discount ratio capture pricing strategy
+    # side note: 1392 games have PriceFinal=0 but IsFree=False which is weird,
+    # we flag that as price_free_mismatch
     initial = df["PriceInitial"].fillna(0).clip(lower=0)
     final   = df["PriceFinal"].fillna(0).clip(lower=0)
     ratio   = np.where(initial > 0, (initial - final) / initial, 0.0)
@@ -111,28 +82,24 @@ def make_price_features(df):
 
 
 def make_steamspy_features(df):
-    """
-    SteamSpy is the strongest predictor group in the dataset.
-
-    Key insight about SteamSpy data: ownership and player estimates are
-    reported in discrete brackets (0-20k, 20k-50k, 50k-100k, …). The raw
-    value is the midpoint of whichever bracket the game falls in, not the
-    exact count. This means two games with 19k and 49k actual owners get
-    reported as the same bucket — the raw number carries bracket noise.
-
-    Converting to percentile rank (0.0-1.0) removes this discretization
-    problem and captures relative popularity directly:
-      - players_rank: 0.786 corr with log target
-      - owners_rank:  0.750 corr with log target
-      Both are stronger than the raw log-transformed values (0.66).
-
-    We also compute bracket bounds (Owners ± Variance) to give the models
-    the actual range boundaries, not just the midpoint.
-
-    All four raw columns (Owners, Players, OwnersVariance, PlayersVariance)
-    are kept — variance columns were wrongly dropped in v1 (they have
-    0.53-0.55 corr with log target).
-    """
+    # steamspy is the strongest predictor group by far
+    #
+    # important thing to know about steamspy: ownership numbers come in
+    # discrete brackets (0-20k, 20k-50k, 50k-100k etc.). the raw value
+    # is just the midpoint of whatever bracket the game falls in, not the
+    # real number. so two games with 19k and 49k actual owners get the
+    # same reported number - that's a lot of noise.
+    #
+    # using percentile rank (0 to 1) instead fixes this:
+    #   - players_rank: 0.786 correlation with log target
+    #   - owners_rank:  0.750 correlation with log target
+    # both beat the raw log-transformed versions (0.66)
+    #
+    # we also compute bracket bounds (Owners +/- Variance) so the model
+    # knows the actual range, not just the midpoint.
+    #
+    # keeping all 4 raw steamspy columns - variance columns were accidentally
+    # dropped in v1 even though they have 0.53-0.55 corr with log target.
     owners   = df["SteamSpyOwners"].fillna(0).clip(lower=0)
     players  = df["SteamSpyPlayersEstimate"].fillna(0).clip(lower=0)
     own_var  = df["SteamSpyOwnersVariance"].fillna(0).clip(lower=0)
@@ -157,13 +124,10 @@ def make_steamspy_features(df):
 
 
 def make_metacritic_features(df):
-    """
-    Metacritic score is 0 for 83% of games — this is missing data (unrated),
-    not an actual score. We handle this with:
-      1. Binary has_metacritic flag (corr=0.46 with log target)
-      2. Keeping the raw score (meaningful only when has_metacritic=1)
-    Games with a Metacritic score average 5020 recommendations vs 435 for unrated.
-    """
+    # metacritic score is 0 for 83% of games - that means "not rated",
+    # not an actual score of 0. so we need a flag for whether the game
+    # even has a metacritic score (corr=0.46 with log target).
+    # games with a score average 5020 recommendations vs 435 for unrated.
     score = df["Metacritic"].fillna(0)
     return pd.DataFrame({
         "metacritic_score": score,
@@ -172,12 +136,10 @@ def make_metacritic_features(df):
 
 
 def make_content_features(df):
-    """
-    Content richness signals: movies, screenshots, DLCs, achievements, packages.
-    All log-compressed due to right skew.
-    PackageCount (corr=0.27), DeveloperCount (0.15), PublisherCount (0.16)
-    were missing from v1 and have been added here.
-    """
+    # content richness: movies, screenshots, DLC, achievements, packages
+    # all log-compressed because of right skew
+    # PackageCount, DeveloperCount, PublisherCount were missing from v1
+    # (corr 0.27, 0.15, 0.16 respectively)
     movies  = np.log1p(df["MovieCount"].fillna(0))
     shots   = np.log1p(df["ScreenshotCount"].fillna(0))
     dlc     = np.log1p(df["DLCCount"].fillna(0))
@@ -201,11 +163,9 @@ def make_content_features(df):
 
 
 def make_language_features(df):
-    """
-    SupportedLanguages is space-delimited (not comma). After stripping
-    the full-audio-support suffix pattern, word count gives number of
-    supported languages (range 0-29, corr=0.21 with log target).
-    """
+    # SupportedLanguages is space-delimited (not comma separated)
+    # after removing the full-audio-support suffix, word count = language count
+    # range is 0-29, corr=0.21 with log target
     cleaned = df["SupportedLanguages"].fillna("").str.replace(
         r"\*[^*]*\*?languages[^*]*", "", regex=True
     )
@@ -219,11 +179,9 @@ def make_language_features(df):
 
 
 def make_platform_features(df):
-    """
-    Platform breadth: Linux and Mac support correlates positively with
-    recommendations (Linux 3.5x, Mac 2.7x average recs vs Windows-only).
-    Cross-platform games tend to be more polished and well-funded.
-    """
+    # linux and mac support correlates positively with recommendations
+    # (linux games get 3.5x more recs on average, mac gets 2.7x vs windows only)
+    # probably because cross-platform games tend to be better funded/polished
     win = df["PlatformWindows"].astype(int)
     lin = df["PlatformLinux"].astype(int)
     mac = df["PlatformMac"].astype(int)
@@ -236,11 +194,8 @@ def make_platform_features(df):
 
 
 def make_multiplayer_features(df):
-    """
-    Multiplayer games average 4-5x more recommendations than single-player.
-    Action+multiplayer is a particularly strong combo (think CS, TF2, Dota —
-    these consistently top the recommendations leaderboard).
-    """
+    # multiplayer games average 4-5x more recommendations than single player
+    # action + multiplayer is especially strong (CS, TF2, Dota etc.)
     is_multi = (
         df["CategoryMultiplayer"] | df["CategoryCoop"] | df["CategoryMMO"]
     ).astype(int)
@@ -260,10 +215,8 @@ def make_multiplayer_features(df):
 
 
 def make_age_features(df):
-    """
-    RequiredAge is 0 for 95% of games. The meaningful split is whether
-    a game is mature (17+), which correlates with larger productions.
-    """
+    # RequiredAge is 0 for 95% of games
+    # the useful signal is really just whether a game is mature rated (17+)
     age = df["RequiredAge"].fillna(0)
     return pd.DataFrame({
         "required_age": age,
@@ -272,11 +225,8 @@ def make_age_features(df):
 
 
 def make_text_richness_features(df):
-    """
-    Text column richness via character length and presence flags.
-    Longer/more detailed descriptions suggest a more polished store page,
-    which correlates with marketing investment and overall game quality.
-    """
+    # longer descriptions = more polished store page = more marketing effort
+    # which correlates with game quality and popularity
     cols = ["AboutText", "ShortDescrip", "DetailedDescrip",
             "PCMinReqsText", "PCRecReqsText", "Reviews"]
     out = {}
@@ -293,14 +243,11 @@ def make_text_richness_features(df):
 
 
 def make_interaction_features(df):
-    """
-    Hand-crafted interaction terms between strongest predictors.
-    owners_x_metacritic (corr=0.51): a game with many owners AND critical
-    acclaim is almost certainly a genuine blockbuster.
-    var_x_owners: high variance relative to ownership means the game sits
-    near a SteamSpy bracket boundary, so it could be more popular than
-    the midpoint estimate suggests.
-    """
+    # hand-crafted interaction terms between strongest predictors
+    # owners_x_metacritic (corr=0.51): lots of owners AND critical acclaim
+    # basically guarantees a blockbuster
+    # var_x_owners: high variance relative to ownership = near a steamspy
+    # bracket boundary, so actual popularity might be higher than midpoint
     log_owners  = np.log1p(df["SteamSpyOwners"].fillna(0).clip(lower=0))
     log_players = np.log1p(df["SteamSpyPlayersEstimate"].fillna(0).clip(lower=0))
     log_own_var = np.log1p(df["SteamSpyOwnersVariance"].fillna(0).clip(lower=0))
@@ -316,10 +263,7 @@ def make_interaction_features(df):
 
 
 def engineer_features(df):
-    """
-    Assemble the full feature matrix. Grouped by semantic category to
-    make the preprocessing pipeline transparent and easy to explain.
-    """
+    # put everything together
     parts = [
         make_date_features(df),
         make_price_features(df),
@@ -334,11 +278,11 @@ def engineer_features(df):
         make_interaction_features(df),
     ]
 
-    # Boolean category/genre columns → integers
+    # boolean category/genre columns -> integers
     bool_cols = df.select_dtypes(include="bool").columns
     parts.append(df[bool_cols].astype(int))
 
-    # Remaining raw numeric columns not already handled above
+    # any remaining numeric columns we haven't already handled
     already_handled = {
         "PriceInitial", "PriceFinal",
         "SteamSpyOwners", "SteamSpyOwnersVariance",
@@ -352,7 +296,7 @@ def engineer_features(df):
              if c not in already_handled]
     parts.append(df[extra])
 
-    # Currency one-hot (USD and empty string)
+    # one-hot encode currency
     parts.append(pd.get_dummies(df["PriceCurrency"].fillna("Unknown"),
                                 prefix="currency"))
 
@@ -367,10 +311,8 @@ def engineer_features(df):
 # =============================================================================
 
 def compute_metrics(y_true_log, y_pred_log):
-    """
-    Metrics on both log scale (model comparison) and original scale
-    (interpretability). Clip before inverse-transform to avoid overflow.
-    """
+    # compute metrics on both log scale (for model comparison) and
+    # original scale (so we can actually interpret the numbers)
     y_pred_log = np.clip(y_pred_log, -20, 20)
     y_true     = np.expm1(y_true_log)
     y_pred     = np.clip(np.expm1(y_pred_log), 0, None)
@@ -507,12 +449,9 @@ def plot_r2_comparison(results, path):
 # =============================================================================
 
 def get_oof_predictions(model, X, y, kfold):
-    """
-    Out-of-fold predictions for stacking.
-    Each row is predicted by a model that was trained on all other folds —
-    no row is ever in both the training set and the prediction set.
-    This prevents the meta-learner from exploiting overfitting in base models.
-    """
+    # out-of-fold predictions for stacking
+    # each row gets predicted by a model that never saw it during training
+    # this stops the meta-learner from exploiting base model overfitting
     oof_preds = np.zeros(len(y))
     for train_idx, val_idx in kfold.split(X):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -527,25 +466,24 @@ def get_oof_predictions(model, X, y, kfold):
 # =============================================================================
 
 def main():
-    # ── Load ──────────────────────────────────────────────────────────────────
+    # load data
     df = pd.read_csv(DATA_PATH)
     print(f"Loaded {df.shape[0]} rows, {df.shape[1]} columns")
 
-    # ── Feature engineering ───────────────────────────────────────────────────
+    # feature engineering
     X = engineer_features(df)
     y = np.log1p(df[TARGET])
 
     print(f"Engineered feature matrix: {X.shape}")
     plot_target_dist(df[TARGET], f"{PLOTS_DIR}/target_distribution.png")
 
-    # ── Train / test split (80/20) ────────────────────────────────────────────
+    # 80/20 train test split
     X_train_raw, X_test_raw, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE
     )
 
-    # ── Imputation ────────────────────────────────────────────────────────────
-    # Median imputation — robust to heavy skew in count/price columns.
-    # Fitted on training set only to prevent data leakage.
+    # median imputation - more robust than mean for skewed columns
+    # fit on train only to avoid leakage
     imputer     = SimpleImputer(strategy="median")
     X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw),
                                columns=X_train_raw.columns, index=X_train_raw.index)
@@ -554,10 +492,8 @@ def main():
 
     kfold = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
-    # ── Feature selection for Ridge (filter method) ───────────────────────────
-    # Tree models select features internally via splits so SelectKBest only
-    # applies to Ridge. Extended search to k=80 since k=60 was still the
-    # best at the boundary of the previous run.
+    # feature selection for Ridge only (tree models handle this internally)
+    # extended to k=80 because k=60 was still winning last time
     print("\nSelecting features for Ridge via mutual information ...")
     best_k, best_k_r2 = 20, -np.inf
     for k in [20, 30, 40, 50, 60, 70, 80]:
@@ -590,12 +526,12 @@ def main():
     all_results = []
 
     # =========================================================================
-    # MODEL 1 — Ridge Regression
+    # MODEL 1 - Ridge Regression
     # =========================================================================
-    # Ridge adds L2 regularization (penalizes large coefficients) to OLS.
-    # More stable than plain linear regression when features are correlated.
-    # We tune alpha via K-Fold cross-validation.
-    print("\n── Ridge Regression ──")
+    # adds L2 regularization to linear regression so large coefficients
+    # get penalized. more stable than plain OLS when features are correlated.
+    # tuning alpha via cross-validation.
+    print("\n-- Ridge Regression --")
     best_alpha, best_ridge_r2 = 1.0, -np.inf
     for alpha in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
         pipe  = Pipeline([("sc", StandardScaler()), ("m", Ridge(alpha=alpha))])
@@ -627,14 +563,12 @@ def main():
     all_results.append({"model": f"Ridge (α={best_alpha})", **ridge_m})
 
     # =========================================================================
-    # MODEL 2 — Random Forest
+    # MODEL 2 - Random Forest
     # =========================================================================
-    # Random Forest builds many decision trees in parallel on random subsets
-    # of the data (bagging) and random feature subsets at each split.
-    # Averaging trees reduces variance without increasing bias.
-    # Uses the full imputed feature set — RF handles irrelevant features
-    # naturally by rarely selecting them for splits.
-    print("\n── Random Forest ──")
+    # builds lots of trees in parallel on random subsets of data and features
+    # averaging them reduces variance without hurting bias too much
+    # uses all features - RF naturally ignores irrelevant ones by not splitting on them
+    print("\n-- Random Forest --")
     best_rf_params, best_rf_r2 = {"n_estimators": 200, "max_depth": 20}, -np.inf
 
     for n_est in [100, 200]:
@@ -676,15 +610,13 @@ def main():
     all_results.append({"model": "Random Forest", **rf_m})
 
     # =========================================================================
-    # MODEL 3 — LightGBM
+    # MODEL 3 - LightGBM
     # =========================================================================
-    # LightGBM grows trees leaf-wise (best-first) rather than level-wise,
-    # finding better splits faster. Key differences from RF:
-    #   - Sequential: each tree corrects the residuals of previous trees
-    #   - num_leaves controls complexity more directly than max_depth
-    #   - Built-in L1/L2 regularization (reg_alpha, reg_lambda)
-    #   - colsample_bytree randomly samples features per tree (like RF)
-    print("\n── LightGBM ──")
+    # grows trees leaf-wise instead of level-wise so it finds better splits faster
+    # key difference from RF: sequential, each tree corrects previous tree's errors
+    # num_leaves controls complexity more directly than max_depth
+    # has built in L1/L2 reg and feature subsampling like RF
+    print("\n-- LightGBM --")
     best_lgb_params = {"n_estimators": 500, "num_leaves": 31}
     best_lgb_r2     = -np.inf
 
@@ -735,21 +667,18 @@ def main():
     all_results.append({"model": "LightGBM", **lgb_m})
 
     # =========================================================================
-    # MODEL 4 — Stacked Ensemble (RF + LightGBM → Ridge meta-learner)
+    # MODEL 4 - Stacked Ensemble (RF + LightGBM -> Ridge meta-learner)
     # =========================================================================
-    # Stacking trains a meta-model on the predictions of base models rather
-    # than directly on input features.
+    # instead of training directly on features, the meta-model trains on the
+    # predictions of the two base models.
     #
-    # Out-of-fold (OOF) predictions are the key to making this work without
-    # leakage. For each fold, we train the base model on the other 4 folds
-    # and predict on the held-out fold — so no prediction uses data the
-    # base model was trained on. The resulting OOF predictions are used as
-    # meta-features to train the Ridge meta-learner.
+    # the trick is using out-of-fold predictions so there's no leakage.
+    # for each fold we train on the other 4 folds and predict on the held out
+    # one - so no prediction ever uses data the model was trained on.
+    # those OOF predictions become the training data for the meta Ridge model.
     #
-    # For the test set, we use the base models retrained on all training data.
-    #
-    # This remains a pure regression pipeline end-to-end.
-    print("\n── Stacked Ensemble (RF + LightGBM → Ridge meta-learner) ──")
+    # for test predictions we just retrain the base models on all of train.
+    print("\n-- Stacked Ensemble (RF + LightGBM -> Ridge meta-learner) --")
 
     rf_for_stack  = RandomForestRegressor(**best_rf_params, min_samples_leaf=4,
                                           n_jobs=-1, random_state=RANDOM_STATE)
@@ -760,14 +689,14 @@ def main():
         n_jobs=-1, random_state=RANDOM_STATE, verbose=-1,
     )
 
-    print("  Generating OOF predictions for RF ...")
+    print("  Getting OOF predictions for RF ...")
     rf_oof  = get_oof_predictions(rf_for_stack,  X_train_imp, y_train, kfold)
-    print("  Generating OOF predictions for LightGBM ...")
+    print("  Getting OOF predictions for LightGBM ...")
     lgb_oof = get_oof_predictions(lgb_for_stack, X_train_imp, y_train, kfold)
 
     meta_train = np.column_stack([rf_oof, lgb_oof])
 
-    # Retrain on full training set for test predictions
+    # retrain on full training set for final test predictions
     rf_for_stack.fit(X_train_imp,  y_train)
     lgb_for_stack.fit(X_train_imp, y_train)
     meta_test = np.column_stack([
@@ -803,11 +732,11 @@ def main():
 
     all_results.append({"model": "Stacked Ensemble", **stack_m})
 
-    # ── Comparison plots ──────────────────────────────────────────────────────
+    # comparison plots
     plot_model_comparison(all_results, f"{PLOTS_DIR}/model_comparison.png")
     plot_r2_comparison(all_results,    f"{PLOTS_DIR}/r2_comparison.png")
 
-    # ── Save metrics ──────────────────────────────────────────────────────────
+    # save metrics to json
     summary = {
         "dataset_shape":               list(df.shape),
         "train_size":                  int(len(X_train_imp)),
