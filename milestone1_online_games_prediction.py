@@ -1,19 +1,17 @@
 """
-Milestone 1 - Predicting RecommendationCount for Online Games
+Milestone 1 - Online Games Popularity Prediction
+predicting RecommendationCount
 
-We tried 4 models:
-    1. Ridge Regression - basic linear model with regularization (our baseline)
-    2. Random Forest - ensemble of trees, handles non-linear stuff well
-    3. LightGBM - gradient boosting, usually best on tabular data
-    4. Stacked Ensemble - combines RF + LightGBM predictions using Ridge on top
+models we used:
+    1. Ridge - linear baseline with L2 regularization
+    2. Random Forest - tree ensemble, handles nonlinear relationships
+    3. LightGBM - gradient boosting, generally best on tabular data
+    4. Stacked Ensemble - RF + LightGBM predictions fed into Ridge
 
-Structure:
-    Step 1 - preprocess_all_columns(): cleans every single column in the raw
-             dataset, even ones we won't use later. This is required before
-             any feature selection or model building.
-    Step 2 - engineer_features(): builds the actual model features from the
-             cleaned data. some columns get dropped here with justification.
-    Step 3 - models
+flow:
+    preprocess_all_columns() -> engineer_features() -> models
+    preprocessing touches every column first (even ones we don't end up using),
+    then feature engineering picks what to actually model on.
 """
 
 import json
@@ -48,242 +46,146 @@ sns.set_theme(style="whitegrid")
 
 
 # =============================================================================
-# STEP 1 - PREPROCESSING (every column in the raw dataset)
+# STEP 1 - PREPROCESSING
+# clean every single column before doing anything else
 # =============================================================================
 
 def preprocess_all_columns(df):
-    """
-    Cleans and standardizes every column in the raw dataset.
-    We do this before any feature engineering or model building.
-    Columns we won't model on are still cleaned here - we just document
-    why we drop them later in engineer_features().
-
-    Returns a new dataframe with all columns cleaned.
-    """
+    # goes through every column and cleans it up
+    # stuff we won't model on still gets cleaned here, we just note why
+    # we don't use it later in engineer_features
     df = df.copy()
 
-    # ------------------------------------------------------------------
-    # ID columns: QueryID, ResponseID
-    # ------------------------------------------------------------------
-    # numeric, no nulls, no cleaning needed
-    # QueryID has -0.47 corr with log target (lower ID = older/more
-    # established game = more time to accumulate recs).
-    # 99.3% of rows have QueryID == ResponseID (game queried against itself)
-    # so these are basically just the steam app ID.
+    # QueryID, ResponseID
+    # already clean integers, no nulls. QueryID has -0.47 corr with log target
+    # (lower steam ID = older game = more time to build up recommendations).
+    # 99.3% of rows have QueryID == ResponseID so they're basically the app ID.
 
-    # ------------------------------------------------------------------
-    # Name columns: QueryName, ResponseName
-    # ------------------------------------------------------------------
-    # strip whitespace, fill the one null in QueryName with ResponseName
+    # QueryName, ResponseName
+    # strip whitespace, patch the one null in QueryName using ResponseName
     df["QueryName"]    = df["QueryName"].fillna(df["ResponseName"]).str.strip()
     df["ResponseName"] = df["ResponseName"].str.strip()
-    # not used in modeling - 11301 unique values in 11357 rows means
-    # almost every game name appears only once, making encoding useless.
-    # the ID columns already capture game identity.
+    # we don't use names in modeling - 11301 unique values out of 11357 rows
+    # means almost every game appears once so encoding does nothing useful.
+    # the ID columns already tell us which game it is.
 
-    # ------------------------------------------------------------------
-    # ReleaseDate
-    # ------------------------------------------------------------------
-    # stored as string, parse to datetime. no nulls in raw data.
+    # ReleaseDate - string in raw csv, convert to datetime
+    # checked: 0 null dates after parsing
     df["ReleaseDate"] = pd.to_datetime(df["ReleaseDate"], errors="coerce")
-    # 0 nulls after parsing (all dates are valid)
 
-    # ------------------------------------------------------------------
-    # RequiredAge
-    # ------------------------------------------------------------------
-    # already integer, no nulls. values: 0, 7, 12, 13, 16, 17, 18, 21
-    # 95% of games are 0 (no age restriction). leave as-is.
+    # RequiredAge - integer, no nulls, values are 0/7/12/13/16/17/18/21
+    # 95% are 0 (no restriction), fine as-is
 
-    # ------------------------------------------------------------------
-    # DemoCount
-    # ------------------------------------------------------------------
-    # integer 0-2, no nulls. low corr with target (0.09). cleaned, kept.
-    # we log-compress it in feature engineering.
+    # DemoCount - integer 0-2, no nulls, corr with target is only 0.09
+    # low signal but we still log compress it in engineering and let
+    # feature selection deal with it for Ridge
 
-    # ------------------------------------------------------------------
-    # DeveloperCount, PublisherCount
-    # ------------------------------------------------------------------
-    # integers, no nulls. small positive corr with target (~0.15).
-    # leave as-is, log-compress in feature engineering.
+    # DeveloperCount, PublisherCount - integers, no nulls, corr ~0.15
+    # leave as-is, log compress later
 
-    # ------------------------------------------------------------------
     # DLCCount, MovieCount, ScreenshotCount, PackageCount
-    # ------------------------------------------------------------------
-    # integers, no nulls, right-skewed counts.
-    # leave as-is, log-compress in feature engineering.
+    # integers, no nulls, right skewed counts - handle in engineering
 
-    # ------------------------------------------------------------------
-    # AchievementCount, AchievementHighlightedCount
-    # ------------------------------------------------------------------
-    # integers, no nulls, right-skewed counts.
-    # leave as-is, log-compress in feature engineering.
+    # AchievementCount, AchievementHighlightedCount - same
 
-    # ------------------------------------------------------------------
-    # Metacritic
-    # ------------------------------------------------------------------
-    # integer 0-97, no nulls. BUT 83% of games have score=0 which means
-    # "not rated", not an actual score of 0. we handle this with a flag
-    # in feature engineering. leave the raw column as-is here.
+    # Metacritic - integer 0-97, no nulls
+    # but 83% of games are 0 which means "not rated" not actually 0
+    # we deal with this in feature engineering using a flag
+    # leave raw column alone here
 
-    # ------------------------------------------------------------------
-    # SteamSpy columns (all 4)
-    # ------------------------------------------------------------------
-    # SteamSpyOwners, SteamSpyOwnersVariance,
-    # SteamSpyPlayersEstimate, SteamSpyPlayersVariance
-    # all integers, no nulls. extremely right-skewed (max in millions).
-    # note: steamspy reports in brackets so these are midpoints, not
-    # exact counts. leave raw values as-is, handle in feature engineering.
+    # SteamSpy columns (all 4: Owners, OwnersVariance, PlayersEstimate, PlayersVariance)
+    # no nulls, very right skewed (some games have millions of owners)
+    # steamspy uses brackets so raw values are midpoints not exact counts
+    # all handled in feature engineering
 
-    # ------------------------------------------------------------------
-    # RecommendationCount (target)
-    # ------------------------------------------------------------------
-    # integer, no nulls. extremely right-skewed (skew=68, 63% are zeros).
-    # we apply log1p transform during modeling, not here.
+    # RecommendationCount (the target)
+    # no nulls, skew=68, 63% are zeros. log1p applied during modeling not here.
 
-    # ------------------------------------------------------------------
-    # PriceCurrency
-    # ------------------------------------------------------------------
-    # only 2 values: "USD" and empty string. fill empty with "Unknown".
+    # PriceCurrency - only "USD" or empty string
     df["PriceCurrency"] = df["PriceCurrency"].replace("", "Unknown").fillna("Unknown")
 
-    # ------------------------------------------------------------------
-    # PriceInitial, PriceFinal
-    # ------------------------------------------------------------------
-    # floats, no nulls. clip to >= 0 (no negative prices make sense).
-    # 1392 games have PriceFinal=0 but IsFree=False - that's a data
-    # inconsistency we flag in feature engineering.
+    # PriceInitial, PriceFinal - floats, no nulls
+    # clip at 0 because negative prices don't make sense
+    # note: 1392 games have PriceFinal=0 but IsFree=False, we flag that later
     df["PriceInitial"] = df["PriceInitial"].clip(lower=0)
     df["PriceFinal"]   = df["PriceFinal"].clip(lower=0)
 
-    # ------------------------------------------------------------------
-    # Boolean columns (all of them)
-    # ------------------------------------------------------------------
-    # ControllerSupport, IsFree, FreeVerAvail, PurchaseAvail,
-    # SubscriptionAvail, PlatformWindows, PlatformLinux, PlatformMac,
+    # all boolean columns (35 of them):
+    # ControllerSupport, IsFree, FreeVerAvail, PurchaseAvail, SubscriptionAvail,
+    # PlatformWindows, PlatformLinux, PlatformMac,
     # PCReqsHaveMin, PCReqsHaveRec, LinuxReqsHaveMin, LinuxReqsHaveRec,
-    # MacReqsHaveMin, MacReqsHaveRec, CategorySinglePlayer,
-    # CategoryMultiplayer, CategoryCoop, CategoryMMO, CategoryInAppPurchase,
-    # CategoryIncludeSrcSDK, CategoryIncludeLevelEditor, CategoryVRSupport,
-    # GenreIsNonGame, GenreIsIndie, GenreIsAction, GenreIsAdventure,
-    # GenreIsCasual, GenreIsStrategy, GenreIsRPG, GenreIsSimulation,
-    # GenreIsEarlyAccess, GenreIsFreeToPlay, GenreIsSports, GenreIsRacing,
-    # GenreIsMassivelyMultiplayer
-    # all already bool dtype with no nulls. convert to int for modeling.
+    # MacReqsHaveMin, MacReqsHaveRec,
+    # CategorySinglePlayer, CategoryMultiplayer, CategoryCoop, CategoryMMO,
+    # CategoryInAppPurchase, CategoryIncludeSrcSDK, CategoryIncludeLevelEditor, CategoryVRSupport,
+    # GenreIsNonGame, GenreIsIndie, GenreIsAction, GenreIsAdventure, GenreIsCasual,
+    # GenreIsStrategy, GenreIsRPG, GenreIsSimulation, GenreIsEarlyAccess,
+    # GenreIsFreeToPlay, GenreIsSports, GenreIsRacing, GenreIsMassivelyMultiplayer
+    # all already bool with no nulls, just convert to int for sklearn
     bool_cols = df.select_dtypes(include="bool").columns.tolist()
     for col in bool_cols:
         df[col] = df[col].astype(int)
 
-    # ------------------------------------------------------------------
-    # SupportEmail
-    # ------------------------------------------------------------------
-    # string, 2 nulls. fill nulls with empty string.
-    # high cardinality (5359 unique) so we only use it as a has/hasn't flag.
+    # SupportEmail - 2 nulls, fill with empty string
+    # too many unique values (5359) to encode meaningfully, use as a flag
     df["SupportEmail"] = df["SupportEmail"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # SupportURL
-    # ------------------------------------------------------------------
-    # string, 1 null. fill with empty string.
-    # used as has/hasn't flag only - actual URLs are not useful for modeling.
+    # SupportURL - 1 null, fill with empty string, use as flag only
     df["SupportURL"] = df["SupportURL"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # Website
-    # ------------------------------------------------------------------
-    # string, 2713 nulls (24% missing). fill nulls with empty string.
-    # used as has/hasn't flag.
+    # Website - 2713 nulls (24% missing!), fill with empty, use as flag
     df["Website"] = df["Website"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # AboutText, ShortDescrip, DetailedDescrip
-    # ------------------------------------------------------------------
-    # strings, no nulls. strip whitespace. used as text length features.
+    # main text columns - strip whitespace, fill nulls
     for col in ["AboutText", "ShortDescrip", "DetailedDescrip"]:
         df[col] = df[col].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # PCMinReqsText, PCRecReqsText
-    # ------------------------------------------------------------------
-    # strings, no nulls. strip whitespace. used as text length features.
     df["PCMinReqsText"] = df["PCMinReqsText"].fillna("").str.strip()
     df["PCRecReqsText"] = df["PCRecReqsText"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # LinuxMinReqsText, LinuxRecReqsText
-    # ------------------------------------------------------------------
-    # strings, no nulls. strip whitespace. used as has/hasn't flags.
-    # not used as length features since Linux reqs are usually copy-paste.
+    # linux/mac req text - strip and clean, use as presence flags only
+    # usually just copy-pasted from PC reqs so length isn't meaningful
     df["LinuxMinReqsText"] = df["LinuxMinReqsText"].fillna("").str.strip()
     df["LinuxRecReqsText"] = df["LinuxRecReqsText"].fillna("").str.strip()
+    df["MacMinReqsText"]   = df["MacMinReqsText"].fillna("").str.strip()
+    df["MacRecReqsText"]   = df["MacRecReqsText"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # MacMinReqsText, MacRecReqsText
-    # ------------------------------------------------------------------
-    # same as Linux. strip and keep as flags only.
-    df["MacMinReqsText"] = df["MacMinReqsText"].fillna("").str.strip()
-    df["MacRecReqsText"] = df["MacRecReqsText"].fillna("").str.strip()
-
-    # ------------------------------------------------------------------
-    # Reviews
-    # ------------------------------------------------------------------
-    # string, no nulls (but many are empty/whitespace = no review).
-    # used as text length feature and has/hasn't flag.
+    # Reviews - no nulls but many empty strings
     df["Reviews"] = df["Reviews"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # SupportedLanguages
-    # ------------------------------------------------------------------
-    # string, no nulls. space-delimited (NOT comma-delimited like it looks).
-    # needs special parsing to count languages - done in feature engineering.
+    # SupportedLanguages - no nulls, looks comma separated but is actually
+    # space delimited. special parsing happens in feature engineering.
     df["SupportedLanguages"] = df["SupportedLanguages"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # LegalNotice
-    # ------------------------------------------------------------------
-    # string, 1 null. fill with empty string. used as has/hasn't flag only.
-    # actual legal text is not useful for modeling.
+    # LegalNotice - 1 null, fill, use as flag (actual text not useful)
     df["LegalNotice"] = df["LegalNotice"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # DRMNotice
-    # ------------------------------------------------------------------
-    # string, no nulls (but many empty). fill and use as has/hasn't flag.
-    # 41 unique values - games with DRM notices tend to be bigger releases.
+    # DRMNotice - many empty strings, fill and flag
+    # games with DRM notices tend to be larger releases
     df["DRMNotice"] = df["DRMNotice"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # ExtUserAcctNotice
-    # ------------------------------------------------------------------
-    # string, no nulls (many empty). fill and use as has/hasn't flag.
-    # indicates games requiring external accounts (e.g. Ubisoft Connect).
+    # ExtUserAcctNotice - many empty, fill and flag
+    # means the game requires an external account (ubisoft connect etc.)
     df["ExtUserAcctNotice"] = df["ExtUserAcctNotice"].fillna("").str.strip()
 
-    # ------------------------------------------------------------------
-    # Background
-    # ------------------------------------------------------------------
-    # string - this is just a URL to the game's store page background image.
-    # not useful for modeling (just a CDN link, no semantic content).
-    # cleaned here (fill null), will be dropped in feature engineering.
-    df["Background"] = df["Background"].fillna("").str.strip()
-
-    # ------------------------------------------------------------------
-    # HeaderImage
-    # ------------------------------------------------------------------
-    # string - URL to the header image. same situation as Background.
-    # cleaned here (fill null), will be dropped in feature engineering.
-    df["HeaderImage"] = df["HeaderImage"].fillna("").str.strip()
+    # Background and HeaderImage - just CDN urls to store page images
+    # no useful content for modeling. cleaned here, dropped in engineering.
+    df["Background"]   = df["Background"].fillna("").str.strip()
+    df["HeaderImage"]  = df["HeaderImage"].fillna("").str.strip()
 
     return df
 
 
 # =============================================================================
-# STEP 2 - FEATURE ENGINEERING (runs on cleaned data)
+# STEP 2 - FEATURE ENGINEERING
+# builds actual model inputs from the cleaned data
+# columns we're dropping from modeling and why:
+#   QueryName/ResponseName: ~11300 unique names in 11357 rows, encoding = noise
+#   Background/HeaderImage: CDN urls, zero semantic content (presence flags kept)
+#   SupportURL: same, presence flag kept
 # =============================================================================
 
 def make_date_features(df):
-    # release_age_days: older games have had more time to accumulate recs
-    # corr=0.36 with log target. QueryID is 0.91 correlated with this but
-    # we keep both since QueryID has no missing values.
+    # release_age_days: older game = more time to collect recommendations
     ref_date = df["ReleaseDate"].dropna().max()
 
     return pd.DataFrame({
@@ -295,9 +197,6 @@ def make_date_features(df):
 
 
 def make_price_features(df):
-    # log compress both price columns (heavy tailed)
-    # is_free and discount ratio capture pricing strategy
-    # price_free_mismatch: 1392 games have PriceFinal=0 but IsFree=False
     initial = df["PriceInitial"]
     final   = df["PriceFinal"]
     ratio   = np.where(initial > 0, (initial - final) / initial, 0.0)
@@ -308,28 +207,30 @@ def make_price_features(df):
         "price_discount_ratio": np.clip(ratio, 0, 1),
         "is_free_price":        (final == 0).astype(int),
         "is_premium":           (final >= 20).astype(int),
+        # flag for the PriceFinal=0 but IsFree=False inconsistency
         "price_free_mismatch":  ((final == 0) & (df["IsFree"] == 0)).astype(int),
     }, index=df.index)
 
 
 def make_steamspy_features(df):
-    # steamspy is the strongest predictor group
+    # steamspy is the strongest feature group by far
     #
-    # important: steamspy reports ownership in discrete brackets
-    # (0-20k, 20k-50k, 50k-100k etc.). raw value is the bracket midpoint,
-    # not the exact count. two games with 19k and 49k actual owners get the
-    # same number - that's real noise in the data.
+    # key thing about steamspy data: ownership isn't an exact number,
+    # it's reported in brackets (0-20k, 20k-50k, 50k-100k, etc.).
+    # the value in the column is just the midpoint of whatever bracket
+    # the game falls into. so a game with 19k owners and one with 49k owners
+    # both show up as the same number - that's a lot of noise.
     #
-    # percentile rank fixes this - converts noisy midpoints to clean 0-1 ranks:
-    #   players_rank: 0.786 corr with log target
-    #   owners_rank:  0.750 corr with log target
-    # both beat the raw log-transformed versions (~0.66)
+    # converting to percentile rank (0 to 1) fixes this problem:
+    #   players_rank has 0.786 corr with log target
+    #   owners_rank has 0.750 corr with log target
+    # both are stronger signals than the raw log versions (~0.66)
     #
-    # bracket bounds (Owners +/- Variance) give the model the actual range
-    # edges explicitly instead of just the midpoint.
+    # we also compute ownership bracket bounds (Owners +/- Variance)
+    # so the model has the actual range edges, not just the midpoint.
     #
-    # all 4 raw steamspy columns are kept - variance columns had 0.53-0.55
-    # corr with log target and were wrongly dropped in an earlier version.
+    # all 4 steamspy columns are kept - the variance columns had 0.53-0.55
+    # corr with log target and got accidentally dropped in an earlier version.
     owners   = df["SteamSpyOwners"]
     players  = df["SteamSpyPlayersEstimate"]
     own_var  = df["SteamSpyOwnersVariance"]
@@ -354,9 +255,10 @@ def make_steamspy_features(df):
 
 
 def make_metacritic_features(df):
-    # score=0 means "not rated" for 83% of games, not an actual 0 score
-    # has_metacritic flag has corr=0.46 with log target
-    # games with a score average 5020 recs vs 435 for unrated
+    # metacritic=0 doesn't mean the game scored 0, it means it was never reviewed
+    # (83% of games fall in this category). so we need a flag for "has score"
+    # which alone has corr=0.46 with log target.
+    # games with a metacritic score average 5020 recommendations vs 435 for unreviewed
     score = df["Metacritic"]
     return pd.DataFrame({
         "metacritic_score": score,
@@ -365,10 +267,9 @@ def make_metacritic_features(df):
 
 
 def make_content_features(df):
-    # content richness: movies, screenshots, DLC, achievements, packages
-    # all log-compressed because of right skew
-    # DemoCount has low corr (0.09) but still included and let feature
-    # selection decide for Ridge; tree models will naturally ignore it
+    # all count columns are right skewed so we log compress everything
+    # DemoCount has low corr (0.09) but including it anyway and letting
+    # SelectKBest filter it out for Ridge; tree models just won't split on it
     return pd.DataFrame({
         "log1p_movie_count":       np.log1p(df["MovieCount"]),
         "log1p_screenshot_count":  np.log1p(df["ScreenshotCount"]),
@@ -384,12 +285,11 @@ def make_content_features(df):
 
 
 def make_language_features(df):
-    # SupportedLanguages is space-delimited (looks comma-separated but isn't)
-    # strip the full-audio suffix pattern then count words = language count
-    # range 0-29, corr=0.21 with log target
-    cleaned = df["SupportedLanguages"].str.replace(
-        r"\*[^*]*\*?languages[^*]*", "", regex=True
-    )
+    # SupportedLanguages looks comma separated but it's actually space delimited
+    # also has a "**N languages with full audio support" suffix we need to strip
+    # after cleaning, word count = number of supported languages (range 0-29)
+    # corr=0.21 with log target
+    cleaned    = df["SupportedLanguages"].str.replace(r"\*[^*]*\*?languages[^*]*", "", regex=True)
     lang_count = cleaned.str.split().apply(len)
 
     return pd.DataFrame({
@@ -400,9 +300,9 @@ def make_language_features(df):
 
 
 def make_platform_features(df):
-    # linux and mac support correlates with more recs
-    # (linux games get 3.5x more recs on average, mac 2.7x vs windows only)
-    # probably because cross-platform games tend to be better funded
+    # linux games average 3.5x more recommendations, mac 2.7x vs windows only
+    # probably not because linux users write more reviews - more likely that
+    # cross-platform games tend to be bigger/better funded projects
     return pd.DataFrame({
         "platform_count": df["PlatformWindows"] + df["PlatformLinux"] + df["PlatformMac"],
         "supports_linux": df["PlatformLinux"],
@@ -411,11 +311,9 @@ def make_platform_features(df):
 
 
 def make_multiplayer_features(df):
-    # multiplayer games average 4-5x more recs than single player
-    # action + multiplayer especially strong (CS, TF2, Dota etc.)
-    is_multi = (
-        df["CategoryMultiplayer"] | df["CategoryCoop"] | df["CategoryMMO"]
-    ).astype(int)
+    # multiplayer games average 4-5x more recs than singleplayer
+    # action+multiplayer is especially dominant (CS, TF2, Dota etc.)
+    is_multi = (df["CategoryMultiplayer"] | df["CategoryCoop"] | df["CategoryMMO"]).astype(int)
 
     lang_count = df["SupportedLanguages"].str.replace(
         r"\*[^*]*\*?languages[^*]*", "", regex=True
@@ -432,8 +330,9 @@ def make_multiplayer_features(df):
 
 
 def make_age_features(df):
-    # RequiredAge is 0 for 95% of games (no restriction)
-    # mature flag (17+) is the useful signal - bigger budget games
+    # RequiredAge is 0 for 95% of games
+    # the only real signal is the mature (17+) flag - those tend to be
+    # higher budget titles with more marketing behind them
     age = df["RequiredAge"]
     return pd.DataFrame({
         "required_age": age,
@@ -442,42 +341,41 @@ def make_age_features(df):
 
 
 def make_text_richness_features(df):
-    # longer descriptions = more polished store page = more marketing effort
-    # = correlates with game quality. we use log-compressed length as a proxy.
-    # for text we won't use as length features (URLs, legal, DRM), we still
-    # create a has/hasn't flag since presence alone carries signal.
+    # longer store page text = more polished = more marketing budget
+    # = correlates with overall game popularity
+    # for columns where the actual content isn't useful (urls, legal text, drm)
+    # we just track whether the field is filled in at all
     out = {}
 
-    # length + presence for main text columns
     for col in ["AboutText", "ShortDescrip", "DetailedDescrip",
                 "PCMinReqsText", "PCRecReqsText", "Reviews"]:
         out[f"{col}_len"] = np.log1p(df[col].str.len())
         out[f"{col}_has"] = (df[col] != "").astype(int)
 
-    # presence flags only for secondary text columns
-    out["has_linux_min_reqs"]    = (df["LinuxMinReqsText"] != "").astype(int)
-    out["has_linux_rec_reqs"]    = (df["LinuxRecReqsText"] != "").astype(int)
-    out["has_mac_min_reqs"]      = (df["MacMinReqsText"] != "").astype(int)
-    out["has_mac_rec_reqs"]      = (df["MacRecReqsText"] != "").astype(int)
-    out["has_support_email"]     = (df["SupportEmail"] != "").astype(int)
-    out["has_support_url"]       = (df["SupportURL"] != "").astype(int)
-    out["has_website"]           = (df["Website"] != "").astype(int)
-    out["has_legal_notice"]      = (df["LegalNotice"] != "").astype(int)
-    out["has_drm_notice"]        = (df["DRMNotice"] != "").astype(int)
-    out["has_ext_acct_notice"]   = (df["ExtUserAcctNotice"] != "").astype(int)
-
-    # Background and HeaderImage are CDN URLs with no useful content
-    # we verify they exist (non-empty) but won't use the URLs themselves
-    out["has_background_img"]    = (df["Background"] != "").astype(int)
-    out["has_header_img"]        = (df["HeaderImage"] != "").astype(int)
+    out["has_linux_min_reqs"]  = (df["LinuxMinReqsText"] != "").astype(int)
+    out["has_linux_rec_reqs"]  = (df["LinuxRecReqsText"] != "").astype(int)
+    out["has_mac_min_reqs"]    = (df["MacMinReqsText"] != "").astype(int)
+    out["has_mac_rec_reqs"]    = (df["MacRecReqsText"] != "").astype(int)
+    out["has_support_email"]   = (df["SupportEmail"] != "").astype(int)
+    out["has_support_url"]     = (df["SupportURL"] != "").astype(int)
+    out["has_website"]         = (df["Website"] != "").astype(int)
+    out["has_legal_notice"]    = (df["LegalNotice"] != "").astype(int)
+    out["has_drm_notice"]      = (df["DRMNotice"] != "").astype(int)
+    out["has_ext_acct_notice"] = (df["ExtUserAcctNotice"] != "").astype(int)
+    # Background and HeaderImage are just image CDN links
+    # not modeling the urls but tracking if they're set
+    out["has_background_img"]  = (df["Background"] != "").astype(int)
+    out["has_header_img"]      = (df["HeaderImage"] != "").astype(int)
 
     return pd.DataFrame(out, index=df.index)
 
 
 def make_interaction_features(df):
-    # hand-crafted interactions between the strongest predictors
-    # owners_x_metacritic (corr=0.51): lots of owners + critical acclaim
-    # var_x_owners: high variance near a steamspy bracket boundary
+    # combining the strongest predictors
+    # owners_x_metacritic: game with lots of owners AND critical acclaim
+    # is almost guaranteed to be a blockbuster (corr=0.51 with log target)
+    # var_x_owners: high variance relative to owners = near a steamspy bracket
+    # edge, so actual owner count might be way above the reported midpoint
     log_owners  = np.log1p(df["SteamSpyOwners"])
     log_players = np.log1p(df["SteamSpyPlayersEstimate"])
     log_own_var = np.log1p(df["SteamSpyOwnersVariance"])
@@ -493,16 +391,6 @@ def make_interaction_features(df):
 
 
 def engineer_features(df):
-    """
-    Builds model features from the already-cleaned dataframe.
-    Note: all columns were already preprocessed in preprocess_all_columns().
-    Columns dropped here (with reason):
-      - QueryName, ResponseName: ~11300 unique values in 11357 rows,
-        encoding would just be noise. QueryID already identifies the game.
-      - Background, HeaderImage: just CDN URLs, no semantic content.
-        presence flags are included in make_text_richness_features().
-      - SupportURL: same as above, presence flag included.
-    """
     parts = [
         make_date_features(df),
         make_price_features(df),
@@ -517,7 +405,7 @@ def engineer_features(df):
         make_interaction_features(df),
     ]
 
-    # boolean genre/category columns (already converted to int in preprocessing)
+    # boolean genre/category columns - already int after preprocessing
     bool_cols = [c for c in df.select_dtypes(include=[int, "int64"]).columns
                  if c.startswith(("Category", "Genre", "Platform", "PCReqs",
                                   "LinuxReqs", "MacReqs", "IsFree", "FreeVer",
@@ -525,7 +413,7 @@ def engineer_features(df):
     if bool_cols:
         parts.append(df[bool_cols])
 
-    # remaining numeric columns not already handled
+    # pick up any remaining numeric columns we haven't touched yet
     already_handled = {
         "PriceInitial", "PriceFinal", "RequiredAge",
         "SteamSpyOwners", "SteamSpyOwnersVariance",
@@ -540,7 +428,6 @@ def engineer_features(df):
     if extra_num:
         parts.append(df[extra_num])
 
-    # currency one-hot
     parts.append(pd.get_dummies(df["PriceCurrency"], prefix="currency"))
 
     features = pd.concat(parts, axis=1)
@@ -550,10 +437,11 @@ def engineer_features(df):
 
 
 # =============================================================================
-# EVALUATION
+# EVALUATION HELPER
 # =============================================================================
 
 def compute_metrics(y_true_log, y_pred_log):
+    # metrics on log scale for comparing models + original scale for interpretation
     y_pred_log = np.clip(y_pred_log, -20, 20)
     y_true     = np.expm1(y_true_log)
     y_pred     = np.clip(np.expm1(y_pred_log), 0, None)
@@ -679,12 +567,14 @@ def plot_r2_comparison(results, path):
 
 
 # =============================================================================
-# STACKING HELPER
+# STACKING
 # =============================================================================
 
 def get_oof_predictions(model, X, y, kfold):
-    # out-of-fold predictions for stacking - each row is predicted by a model
-    # that never saw it during training, preventing leakage into the meta-learner
+    # generates out-of-fold predictions for stacking
+    # each row gets predicted by a model that never saw it during training
+    # this prevents the meta-learner from just learning which base model
+    # overfit the most
     oof_preds = np.zeros(len(y))
     for train_idx, val_idx in kfold.split(X):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -699,31 +589,28 @@ def get_oof_predictions(model, X, y, kfold):
 # =============================================================================
 
 def main():
-    # ── Load raw data ─────────────────────────────────────────────────────────
     df_raw = pd.read_csv(DATA_PATH)
     print(f"Loaded {df_raw.shape[0]} rows, {df_raw.shape[1]} columns")
 
-    # ── Step 1: Preprocess ALL columns ────────────────────────────────────────
-    # every column gets cleaned here before anything else happens
+    # step 1: clean everything first
     print("Preprocessing all columns ...")
     df = preprocess_all_columns(df_raw)
     print(f"  Done. Shape unchanged: {df.shape}")
 
-    # ── Step 2: Feature engineering ───────────────────────────────────────────
+    # step 2: build features
     X = engineer_features(df)
     y = np.log1p(df[TARGET])
     print(f"Engineered feature matrix: {X.shape}")
 
     plot_target_dist(df[TARGET], f"{PLOTS_DIR}/target_distribution.png")
 
-    # ── 80/20 train/test split ────────────────────────────────────────────────
+    # 80/20 split
     X_train_raw, X_test_raw, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE
     )
 
-    # ── Imputation ────────────────────────────────────────────────────────────
-    # median imputation - robust to skewed count/price columns
-    # fit only on train to avoid any leakage into test
+    # median imputation - more robust than mean for heavily skewed columns
+    # fit on train only, transform test separately to avoid leakage
     imputer     = SimpleImputer(strategy="median")
     X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw),
                                columns=X_train_raw.columns, index=X_train_raw.index)
@@ -732,10 +619,10 @@ def main():
 
     kfold = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
-    # ── Feature selection for Ridge only ──────────────────────────────────────
-    # tree models handle irrelevant features by just not splitting on them,
-    # so SelectKBest only matters for Ridge. extended search to k=80 since
-    # k=60 was still the winner at the boundary of the previous run.
+    # feature selection for Ridge
+    # tree models handle irrelevant features on their own by not splitting on them
+    # Ridge can't do that so we use SelectKBest with mutual information
+    # k=60 was still winning at the boundary last time so extended search to 80
     print("\nSelecting features for Ridge via mutual information ...")
     best_k, best_k_r2 = 20, -np.inf
     for k in [20, 30, 40, 50, 60, 70, 80]:
@@ -770,8 +657,8 @@ def main():
     # =========================================================================
     # MODEL 1 - Ridge Regression
     # =========================================================================
-    # adds L2 regularization to OLS so correlated features don't blow up
-    # coefficients. tune alpha with cross-validation.
+    # L2 regularization prevents coefficients from blowing up when features
+    # are correlated. we tried 6 alpha values and pick the best one via CV.
     print("\n-- Ridge Regression --")
     best_alpha, best_ridge_r2 = 1.0, -np.inf
     for alpha in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
@@ -805,8 +692,9 @@ def main():
     # =========================================================================
     # MODEL 2 - Random Forest
     # =========================================================================
-    # lots of trees in parallel on random data/feature subsets, average them
-    # uses all features - RF naturally ignores irrelevant ones
+    # builds many trees on random subsets of rows and features, averages them
+    # reduces variance without increasing bias much
+    # we use the full feature set - irrelevant features just don't get split on
     print("\n-- Random Forest --")
     best_rf_params, best_rf_r2 = {"n_estimators": 200, "max_depth": 20}, -np.inf
 
@@ -840,8 +728,7 @@ def main():
     plot_actual_vs_predicted(y_test.values, rf_pred,
                              "Random Forest — original scale",
                              f"{PLOTS_DIR}/rf_scatter.png", log_scale=False)
-    plot_residuals(y_test.values, rf_pred,
-                   "Random Forest", f"{PLOTS_DIR}/rf_residuals.png")
+    plot_residuals(y_test.values, rf_pred, "Random Forest", f"{PLOTS_DIR}/rf_residuals.png")
     plot_feature_importance(rf_model, X_train_imp.columns.tolist(),
                             "Random Forest", "#16a34a",
                             f"{PLOTS_DIR}/rf_feature_importance.png")
@@ -850,9 +737,11 @@ def main():
     # =========================================================================
     # MODEL 3 - LightGBM
     # =========================================================================
-    # grows trees leaf-wise so it finds better splits faster than level-wise
-    # sequential: each tree corrects the previous tree's residuals
-    # num_leaves controls complexity, has built-in L1/L2 reg
+    # different from RF in two main ways:
+    # 1. sequential not parallel - each tree fixes the errors of the last one
+    # 2. grows leaf-wise instead of level-wise, finds better splits faster
+    # num_leaves is the main complexity knob (more direct than max_depth)
+    # has built-in L1/L2 reg and random feature subsampling
     print("\n-- LightGBM --")
     best_lgb_params = {"n_estimators": 500, "num_leaves": 31}
     best_lgb_r2     = -np.inf
@@ -895,8 +784,7 @@ def main():
     plot_actual_vs_predicted(y_test.values, lgb_pred,
                              "LightGBM — original scale",
                              f"{PLOTS_DIR}/lgb_scatter.png", log_scale=False)
-    plot_residuals(y_test.values, lgb_pred,
-                   "LightGBM", f"{PLOTS_DIR}/lgb_residuals.png")
+    plot_residuals(y_test.values, lgb_pred, "LightGBM", f"{PLOTS_DIR}/lgb_residuals.png")
     plot_feature_importance(lgb_model, X_train_imp.columns.tolist(),
                             "LightGBM", "#b45309",
                             f"{PLOTS_DIR}/lgb_feature_importance.png")
@@ -905,11 +793,16 @@ def main():
     # =========================================================================
     # MODEL 4 - Stacked Ensemble (RF + LightGBM -> Ridge meta-learner)
     # =========================================================================
-    # meta-model trains on predictions of the base models instead of raw features
-    # out-of-fold predictions ensure no leakage: each row gets predicted by a
-    # model that never saw it during training. those OOF preds become the
-    # training data for the Ridge meta-learner.
-    # for test, we retrain base models on all of train then feed to meta Ridge.
+    # idea: instead of training directly on features, train a meta model on the
+    # predictions of the two base models. if they make different kinds of errors,
+    # the meta model can learn when to trust each one more.
+    #
+    # the tricky part is that if you just use in-sample predictions as meta
+    # features, the meta model just learns which base model overfit the most.
+    # fix: use out-of-fold predictions. each row is predicted by a model that
+    # was trained on the other 4 folds only, so it never saw that row.
+    # those OOF predictions are what we train the Ridge meta-learner on.
+    # for the test set we retrain both base models on all of train first.
     print("\n-- Stacked Ensemble (RF + LightGBM -> Ridge meta-learner) --")
 
     rf_for_stack  = RandomForestRegressor(**best_rf_params, min_samples_leaf=4,
@@ -928,6 +821,7 @@ def main():
 
     meta_train = np.column_stack([rf_oof, lgb_oof])
 
+    # retrain on full train set for test predictions
     rf_for_stack.fit(X_train_imp,  y_train)
     lgb_for_stack.fit(X_train_imp, y_train)
     meta_test = np.column_stack([
@@ -961,11 +855,9 @@ def main():
                    "Stacked Ensemble", f"{PLOTS_DIR}/stack_residuals.png")
     all_results.append({"model": "Stacked Ensemble", **stack_m})
 
-    # comparison plots
     plot_model_comparison(all_results, f"{PLOTS_DIR}/model_comparison.png")
     plot_r2_comparison(all_results,    f"{PLOTS_DIR}/r2_comparison.png")
 
-    # save metrics
     summary = {
         "dataset_shape":               list(df_raw.shape),
         "train_size":                  int(len(X_train_imp)),
